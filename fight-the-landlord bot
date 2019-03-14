@@ -1,0 +1,1275 @@
+// 斗地主（FightTheLandlord）bot (原样例程序作者：zhouhy）
+// 游戏信息：http://www.botzone.org/games#FightTheLandlord
+
+#include <iostream>
+#include <set>
+#include <string>
+#include <cassert>
+#include <cstring> // 注意memset是cstring里的
+#include <algorithm>
+#include "jsoncpp/json.h" // 在平台上，C++编译时默认包含此库
+
+#define lbd 0.05
+
+using namespace std;
+
+double global_bla;
+int global_cnt;
+
+bool were_to_lose;
+
+using std::vector;
+using std::sort;
+using std::unique;
+using std::set;
+using std::string;
+
+constexpr int PLAYER_COUNT = 3;
+
+enum class CardComboType
+{
+	PASS, // 过
+	SINGLE, // 单张
+	PAIR, // 对子
+	STRAIGHT, // 顺子
+	STRAIGHT2, // 双顺
+	TRIPLET, // 三条
+	TRIPLET1, // 三带一
+	TRIPLET2, // 三带二
+	BOMB, // 炸弹
+	QUADRUPLE2, // 四带二（只）
+	QUADRUPLE4, // 四带二（对）
+	PLANE, // 飞机
+	PLANE1, // 飞机带小翼
+	PLANE2, // 飞机带大翼
+	SSHUTTLE, // 航天飞机
+	SSHUTTLE2, // 航天飞机带小翼
+	SSHUTTLE4, // 航天飞机带大翼
+	ROCKET, // 火箭
+	INVALID // 非法牌型
+};
+
+int cardComboScores[] = {
+	0, // 过
+	1, // 单张
+	2, // 对子
+	6, // 顺子
+	6, // 双顺
+	4, // 三条
+	4, // 三带一
+	4, // 三带二
+	10, // 炸弹
+	8, // 四带二（只）
+	8, // 四带二（对）
+	8, // 飞机
+	8, // 飞机带小翼
+	8, // 飞机带大翼
+	10, // 航天飞机（需要特判：二连为10分，多连为20分）
+	10, // 航天飞机带小翼
+	10, // 航天飞机带大翼
+	16, // 火箭
+	0 // 非法牌型
+};
+
+#ifndef _BOTZONE_ONLINE
+string cardComboStrings[] = {
+	"PASS",
+	"SINGLE",
+	"PAIR",
+	"STRAIGHT",
+	"STRAIGHT2",
+	"TRIPLET",
+	"TRIPLET1",
+	"TRIPLET2",
+	"BOMB",
+	"QUADRUPLE2",
+	"QUADRUPLE4",
+	"PLANE",
+	"PLANE1",
+	"PLANE2",
+	"SSHUTTLE",
+	"SSHUTTLE2",
+	"SSHUTTLE4",
+	"ROCKET",
+	"INVALID"
+};
+#endif
+
+// 用0~53这54个整数表示唯一的一张牌
+using Card = short;
+constexpr Card card_joker = 52;
+constexpr Card card_JOKER = 53;
+
+// 除了用0~53这54个整数表示唯一的牌，
+// 这里还用另一种序号表示牌的大小（不管花色），以便比较，称作等级（Level）
+// 对应关系如下：
+// 3 4 5 6 7 8 9 10	J Q K	A	2	小王	大王
+// 0 1 2 3 4 5 6 7	8 9 10	11	12	13	14
+using Level = short;
+constexpr Level MAX_LEVEL = 15;
+constexpr Level MAX_STRAIGHT_LEVEL = 11;
+constexpr Level level_joker = 13;
+constexpr Level level_JOKER = 14;
+
+/**
+ * 将Card变成Level
+ */
+constexpr Level card2level(Card card)
+{
+	return card / 4 + card / 53;
+}
+
+// 牌的组合，用于计算牌型
+struct CardCombo
+{
+	// 表示同等级的牌有多少张
+	// 会按个数从大到小、等级从大到小排序
+	struct CardPack
+	{
+		Level level;
+		short count;
+
+		bool operator< (const CardPack& b) const
+		{
+			if (count == b.count)
+				return level > b.level;
+			return count > b.count;
+		}
+	};
+	vector<Card> cards; // 原始的牌，未排序
+	vector<CardPack> packs; // 按数目和大小排序的牌种
+	CardComboType comboType; // 算出的牌型
+	Level comboLevel = 0; // 算出的大小序
+
+	/**
+	 * 检查个数最多的CardPack递减了几个
+	 */
+	int findMaxSeq() const
+	{
+		for (unsigned c = 1; c < packs.size(); c++)
+			if (packs[c].count != packs[0].count ||
+				packs[c].level != packs[c - 1].level - 1)
+				return c;
+		return packs.size();
+	}
+
+	/**
+	* 这个牌型最后算总分的时候的权重
+	*/
+	int getWeight() const
+	{
+		if (comboType == CardComboType::SSHUTTLE ||
+			comboType == CardComboType::SSHUTTLE2 ||
+			comboType == CardComboType::SSHUTTLE4)
+			return cardComboScores[(int)comboType] + (findMaxSeq() > 2) * 10;
+		return cardComboScores[(int)comboType];
+	}
+
+	// 创建一个空牌组
+	CardCombo() : comboType(CardComboType::PASS) {}
+
+	/**
+	 * 通过Card（即short）类型的迭代器创建一个牌型
+	 * 并计算出牌型和大小序等
+	 * 假设输入没有重复数字（即重复的Card）
+	 */
+	template <typename CARD_ITERATOR>
+	CardCombo(CARD_ITERATOR begin, CARD_ITERATOR end)
+	{
+		// 特判：空
+		if (begin == end)
+		{
+			comboType = CardComboType::PASS;
+			return;
+		}
+
+		// 每种牌有多少个
+		short counts[MAX_LEVEL + 1] = {};
+
+		// 同种牌的张数（有多少个单张、对子、三条、四条）
+		short countOfCount[5] = {};
+
+		cards = vector<Card>(begin, end);
+		for (Card c : cards)
+			counts[card2level(c)]++;
+		for (Level l = 0; l <= MAX_LEVEL; l++)
+			if (counts[l])
+			{
+				packs.push_back(CardPack{ l, counts[l] });
+				countOfCount[counts[l]]++;
+			}
+		sort(packs.begin(), packs.end());
+
+		// 用最多的那种牌总是可以比较大小的
+		comboLevel = packs[0].level;
+
+		// 计算牌型
+		// 按照 同种牌的张数 有几种 进行分类
+		vector<Card> kindOfCountOfCount;
+		for (int i = 0; i <= 4; i++)
+			if (countOfCount[i])
+				kindOfCountOfCount.push_back(i);
+		sort(kindOfCountOfCount.begin(), kindOfCountOfCount.end());
+
+		int curr, lesser;
+
+		switch (kindOfCountOfCount.size())
+		{
+		case 1: // 只有一类牌
+			curr = countOfCount[kindOfCountOfCount[0]];
+			switch (kindOfCountOfCount[0])
+			{
+			case 1:
+				// 只有若干单张
+				if (curr == 1)
+				{
+					comboType = CardComboType::SINGLE;
+					return;
+				}
+				if (curr == 2 && packs[1].level == level_joker)
+				{
+					comboType = CardComboType::ROCKET;
+					return;
+				}
+				if (curr >= 5 && findMaxSeq() == curr &&
+					packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+				{
+					comboType = CardComboType::STRAIGHT;
+					return;
+				}
+				break;
+			case 2:
+				// 只有若干对子
+				if (curr == 1)
+				{
+					comboType = CardComboType::PAIR;
+					return;
+				}
+				if (curr >= 3 && findMaxSeq() == curr &&
+					packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+				{
+					comboType = CardComboType::STRAIGHT2;
+					return;
+				}
+				break;
+			case 3:
+				// 只有若干三条
+				if (curr == 1)
+				{
+					comboType = CardComboType::TRIPLET;
+					return;
+				}
+				if (findMaxSeq() == curr &&
+					packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+				{
+					comboType = CardComboType::PLANE;
+					return;
+				}
+				break;
+			case 4:
+				// 只有若干四条
+				if (curr == 1)
+				{
+					comboType = CardComboType::BOMB;
+					return;
+				}
+				if (findMaxSeq() == curr &&
+					packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+				{
+					comboType = CardComboType::SSHUTTLE;
+					return;
+				}
+			}
+			break;
+		case 2: // 有两类牌
+			curr = countOfCount[kindOfCountOfCount[1]];
+			lesser = countOfCount[kindOfCountOfCount[0]];
+			if (kindOfCountOfCount[1] == 3)
+			{
+				// 三条带？
+				if (kindOfCountOfCount[0] == 1)
+				{
+					// 三带一
+					if (curr == 1 && lesser == 1)
+					{
+						comboType = CardComboType::TRIPLET1;
+						return;
+					}
+					if (findMaxSeq() == curr && lesser == curr &&
+						packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+					{
+						comboType = CardComboType::PLANE1;
+						return;
+					}
+				}
+				if (kindOfCountOfCount[0] == 2)
+				{
+					// 三带二
+					if (curr == 1 && lesser == 1)
+					{
+						comboType = CardComboType::TRIPLET2;
+						return;
+					}
+					if (findMaxSeq() == curr && lesser == curr &&
+						packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+					{
+						comboType = CardComboType::PLANE2;
+						return;
+					}
+				}
+			}
+			if (kindOfCountOfCount[1] == 4)
+			{
+				// 四条带？
+				if (kindOfCountOfCount[0] == 1)
+				{
+					// 四条带两只 * n
+					if (curr == 1 && lesser == 2)
+					{
+						comboType = CardComboType::QUADRUPLE2;
+						return;
+					}
+					if (findMaxSeq() == curr && lesser == curr * 2 &&
+						packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+					{
+						comboType = CardComboType::SSHUTTLE2;
+						return;
+					}
+				}
+				if (kindOfCountOfCount[0] == 2)
+				{
+					// 四条带两对 * n
+					if (curr == 1 && lesser == 2)
+					{
+						comboType = CardComboType::QUADRUPLE4;
+						return;
+					}
+					if (findMaxSeq() == curr && lesser == curr * 2 &&
+						packs.begin()->level <= MAX_STRAIGHT_LEVEL)
+					{
+						comboType = CardComboType::SSHUTTLE4;
+						return;
+					}
+				}
+			}
+		}
+
+		comboType = CardComboType::INVALID;
+	}
+
+	/**
+	 * 判断指定牌组能否大过当前牌组（这个函数不考虑过牌的情况！）
+	 */
+	bool canBeBeatenBy(const CardCombo& b) const
+	{
+		if (comboType == CardComboType::INVALID || b.comboType == CardComboType::INVALID)
+			return false;
+		if (b.comboType == CardComboType::ROCKET)
+			return true;
+		if (b.comboType == CardComboType::BOMB)
+			switch (comboType)
+			{
+			case CardComboType::ROCKET:
+				return false;
+			case CardComboType::BOMB:
+				return b.comboLevel > comboLevel;
+			default:
+				return true;
+			}
+		return b.comboType == comboType && b.cards.size() == cards.size() && b.comboLevel > comboLevel;
+	}
+
+	/**
+	 * 从指定手牌中寻找第一个能大过当前牌组的牌组
+	 * 如果随便出的话只出第一张
+	 * 如果不存在则返回一个PASS的牌组
+	 */
+	template <typename CARD_ITERATOR>
+	CardCombo findFirstValid(CARD_ITERATOR begin, CARD_ITERATOR end) const
+	{
+		debugPrint();
+		if (comboType == CardComboType::PASS) // 如果不需要大过谁，只需要随便出
+		{
+			CARD_ITERATOR second = begin;
+			second++;
+			return CardCombo(begin, second); // 那么就出第一张牌……
+		}
+
+		// 然后先看一下是不是火箭，是的话就过
+		if (comboType == CardComboType::ROCKET)
+			return CardCombo();
+
+		// 现在打算从手牌中凑出同牌型的牌
+		auto deck = vector<Card>(begin, end); // 手牌
+		short counts[MAX_LEVEL + 1] = {};
+
+		unsigned short kindCount = 0;
+
+		// 先数一下手牌里每种牌有多少个
+		for (Card c : deck)
+			counts[card2level(c)]++;
+
+		// 手牌如果不够用，直接不用凑了，看看能不能炸吧
+		if (deck.size() < cards.size())
+			goto failure;
+
+		// 再数一下手牌里有多少种牌
+		for (short c : counts)
+			if (c)
+				kindCount++;
+
+		// 否则不断增大当前牌组的主牌，看看能不能找到匹配的牌组
+		{
+			// 开始增大主牌
+			int mainPackCount = findMaxSeq();
+			bool isSequential =
+				comboType == CardComboType::STRAIGHT ||
+				comboType == CardComboType::STRAIGHT2 ||
+				comboType == CardComboType::PLANE ||
+				comboType == CardComboType::PLANE1 ||
+				comboType == CardComboType::PLANE2 ||
+				comboType == CardComboType::SSHUTTLE ||
+				comboType == CardComboType::SSHUTTLE2 ||
+				comboType == CardComboType::SSHUTTLE4;
+			for (Level i = 1; ; i++) // 增大多少
+			{
+				for (int j = 0; j < mainPackCount; j++)
+				{
+					int level = packs[j].level + i;
+
+					// 各种连续牌型的主牌不能到2，非连续牌型的主牌不能到小王，单张的主牌不能超过大王
+					if ((comboType == CardComboType::SINGLE && level > MAX_LEVEL) ||
+						(isSequential && level > MAX_STRAIGHT_LEVEL) ||
+						(comboType != CardComboType::SINGLE && !isSequential && level >= level_joker))
+						goto failure;
+
+					// 如果手牌中这种牌不够，就不用继续增了
+					if (counts[level] < packs[j].count)
+						goto next;
+				}
+
+				{
+					// 找到了合适的主牌，那么从牌呢？
+					// 如果手牌的种类数不够，那从牌的种类数就不够，也不行
+					if (kindCount < packs.size())
+						continue;
+
+					// 好终于可以了
+					// 计算每种牌的要求数目吧
+					short requiredCounts[MAX_LEVEL + 1] = {};
+					for (int j = 0; j < mainPackCount; j++)
+						requiredCounts[packs[j].level + i] = packs[j].count;
+					for (unsigned j = mainPackCount; j < packs.size(); j++)
+					{
+						Level k;
+						for (k = 0; k <= MAX_LEVEL; k++)
+						{
+							if (requiredCounts[k] || counts[k] < packs[j].count)
+								continue;
+							requiredCounts[k] = packs[j].count;
+							break;
+						}
+						if (k == MAX_LEVEL + 1) // 如果是都不符合要求……就不行了
+							goto next;
+					}
+
+
+					// 开始产生解
+					vector<Card> solve;
+					for (Card c : deck)
+					{
+						Level level = card2level(c);
+						if (requiredCounts[level])
+						{
+							solve.push_back(c);
+							requiredCounts[level]--;
+						}
+					}
+					return CardCombo(solve.begin(), solve.end());
+				}
+
+			next:
+				; // 再增大
+			}
+		}
+
+	failure:
+		// 实在找不到啊
+		// 最后看一下能不能炸吧
+
+		for (Level i = 0; i < level_joker; i++)
+			if (counts[i] == 4 && (comboType != CardComboType::BOMB || i > packs[0].level)) // 如果对方是炸弹，能炸的过才行
+			{
+				// 还真可以啊……
+				Card bomb[] = { Card(i * 4), Card(i * 4 + 1), Card(i * 4 + 2), Card(i * 4 + 3) };
+				return CardCombo(bomb, bomb + 4);
+			}
+
+		// 有没有火箭？
+		if (counts[level_joker] + counts[level_JOKER] == 2)
+		{
+			Card rocket[] = { card_joker, card_JOKER };
+			return CardCombo(rocket, rocket + 2);
+		}
+
+		// ……
+		return CardCombo();
+	}
+
+	void debugPrint() const
+	{
+#ifndef _BOTZONE_ONLINE
+		std::cout << "【" << cardComboStrings[(int)comboType] <<
+			"共" << cards.size() << "张，大小序" << comboLevel << "】";
+#endif
+	}
+
+	// 牌型信息：comboType + len + val
+	int comboCnt() {
+		return packs[0].count;
+	}
+	int comboLen() {
+		return findMaxSeq();
+	}
+	int comboVal() {
+		return packs[0].level - comboLen() + 1;
+	}
+};
+
+// 我的牌有哪些
+set<Card> myCards;
+
+// 地主被明示的牌有哪些
+set<Card> landlordPublicCards;
+
+// 大家从最开始到现在都出过什么
+vector<vector<Card>> whatTheyPlayed[PLAYER_COUNT];
+	
+// 当前要出的牌需要大过谁
+CardCombo lastValidCombo;
+
+// 大家还剩多少牌
+short cardRemaining[PLAYER_COUNT] = { 20, 17, 17 };
+int levelRemaining[20] = {4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 1, 1};
+
+// 我是几号玩家（0-地主，1-农民甲，2-农民乙）
+int myPosition;
+
+namespace BotzoneIO
+{
+	using namespace std;
+	void input()
+	{
+		// 读入输入（平台上的输入是单行）
+		string line;
+		getline(cin, line);
+		Json::Value input;
+		Json::Reader reader;
+		reader.parse(line, input);
+
+		// 首先处理第一回合，得知自己是谁、有哪些牌
+		{
+			auto firstRequest = input["requests"][0u]; // 下标需要是 unsigned，可以通过在数字后面加u来做到
+			auto own = firstRequest["own"];
+			auto llpublic = firstRequest["public"];
+			auto history = firstRequest["history"];
+			for (unsigned i = 0; i < own.size(); i++)
+				myCards.insert(own[i].asInt());
+			for (unsigned i = 0; i < llpublic.size(); i++)
+				landlordPublicCards.insert(llpublic[i].asInt());
+			if (history[0u].size() == 0)
+				if (history[1].size() == 0)
+					myPosition = 0; // 上上家和上家都没出牌，说明是地主
+				else
+					myPosition = 1; // 上上家没出牌，但是上家出牌了，说明是农民甲
+			else
+				myPosition = 2; // 上上家出牌了，说明是农民乙
+		}
+
+		// history里第一项（上上家）和第二项（上家）分别是谁的决策
+		int whoInHistory[] = { (myPosition - 2 + PLAYER_COUNT) % PLAYER_COUNT, (myPosition - 1 + PLAYER_COUNT) % PLAYER_COUNT };
+
+		int turn = input["requests"].size();
+		for (int i = 0; i < turn; i++)
+		{
+			// 逐次恢复局面到当前
+			auto history = input["requests"][i]["history"]; // 每个历史中有上家和上上家出的牌
+			int howManyPass = 0;
+			for (int p = 0; p < 2; p++)
+			{
+				int player = whoInHistory[p]; // 是谁出的牌
+				auto playerAction = history[p]; // 出的哪些牌
+				vector<Card> playedCards;
+				for (unsigned _ = 0; _ < playerAction.size(); _++) // 循环枚举这个人出的所有牌
+				{
+					int card = playerAction[_].asInt(); // 这里是出的一张牌
+					playedCards.push_back(card);
+					levelRemaining[card2level(card)]--; // 剩余牌的情况
+				}
+				whatTheyPlayed[player].push_back(playedCards); // 记录这段历史
+				cardRemaining[player] -= playerAction.size();
+
+				if (playerAction.size() == 0)
+					howManyPass++;
+				else
+					lastValidCombo = CardCombo(playedCards.begin(), playedCards.end());
+			}
+
+			if (howManyPass == 2)
+				lastValidCombo = CardCombo();
+
+			if (i < turn - 1)
+			{
+				// 还要恢复自己曾经出过的牌
+				auto playerAction = input["responses"][i]; // 出的哪些牌
+				vector<Card> playedCards;
+				for (unsigned _ = 0; _ < playerAction.size(); _++) // 循环枚举自己出的所有牌
+				{
+					int card = playerAction[_].asInt(); // 这里是自己出的一张牌
+					myCards.erase(card); // 从自己手牌中删掉
+					playedCards.push_back(card);
+				}
+				whatTheyPlayed[myPosition].push_back(playedCards); // 记录这段历史
+				cardRemaining[myPosition] -= playerAction.size();
+			}
+			were_to_lose = (min(cardRemaining[1], cardRemaining[2]) - cardRemaining[0] <= -6);
+			if (myPosition != 0) were_to_lose ^= 1;
+		}
+	}
+
+	/**
+	 * 输出决策，begin是迭代器起点，end是迭代器终点
+	 * CARD_ITERATOR是Card（即short）类型的迭代器
+	 */
+	template <typename CARD_ITERATOR>
+	void output(CARD_ITERATOR begin, CARD_ITERATOR end)
+	{
+		Json::Value result, response(Json::arrayValue);
+		for (; begin != end; begin++)
+			response.append(*begin);
+		result["response"] = response;
+
+		Json::FastWriter writer;
+		cout << writer.write(result) << endl;
+	}
+}
+
+namespace Move{
+#define L 15
+#define L2 13
+#define LS 12
+#define pb push_back
+#define oo 0x3f3f3f3f
+	using namespace std;
+	bool Once;
+	struct status {
+		char cnt[L];
+		status(){ for (int i = 0; i < L; ++i) cnt[i] = 0; }
+		status(vector<Card> v) {
+			for (int i = 0; i < L; ++i) cnt[i] = 0;
+			for (int i = 0; i < v.size(); ++i)
+				++cnt[v[i]];
+		}
+		int Min() {
+			for (int i = 0; i < L; ++i)
+				if (cnt[i]) return i;
+			return -1;
+		}
+		bool operator < (const status &b) const {
+			for (int i = 0; i < L; ++i) {
+				if (cnt[i] < b.cnt[i]) return 1;
+				if (cnt[i] > b.cnt[i]) return 0;
+			}
+			return 0;
+		}
+		void out() {
+			for (int i = 0; i < L; ++i)
+				if (cnt[i])
+					printf("[%d] * %d ", i, cnt[i]);
+			puts("");
+		}
+	};
+	map<status, double> H;
+	void gmin(double &a, double b) {
+		if (b < a) a = b;
+	}
+	double vb(int x) { 
+		if (myPosition == 2) { // 在地主前出牌的农民
+			return (15 - x) / 3.0 + 7; // 7.5 / 3 + 7 = 9.5 avg
+		} else {
+			return (15 - x) / 5.0 + 8;  // 7.5 / 5 + 8 = 9.5 avg
+		}
+	}
+	double v_pair, v_triple, v_quad;
+	double str[20][5];
+	status global_s;
+
+	void calc_val(status s) {
+		for (int cnt = 1; cnt <= 4; ++cnt)
+			for (int len = 1; len <= L; ++len) {
+				int tot = 0; double sum = 0;
+				for (int l = 0; l < L; ++l) {
+					int r = l + len - 1;
+					if (len > 1 && r >= LS) continue;
+					if (r >= L) continue;
+					bool flag = 1;
+					for (int i = l; i <= r; ++i)
+						if (s.cnt[i] < cnt) { flag = 0; break; }
+					if (flag) {
+						++tot; sum += vb(r);
+					}
+				}
+				str[len][cnt] = sum / 7 / tot + tot * 0.05;
+				//printf("str len = %d, cnt = %d, val = %.3lf\n", len, cnt, str[len][cnt]);
+			}
+		v_pair = str[1][2];
+		v_triple = str[1][3];
+		v_quad = str[1][4];
+	}
+
+
+	double kc(double k, double c) {
+		return (k < 0) ? k * c : k / c;
+	}
+	double val_single(int x) { 
+		double b = lbd * cardComboScores[(int)CardComboType::SINGLE];
+		return vb(x) + b;
+	}
+	double val_pair(int x) { 
+		double b = lbd * cardComboScores[(int)CardComboType::PAIR];
+		return vb(x) + b;
+	}
+	double val_triple(int x) { 
+		double b = lbd * cardComboScores[(int)CardComboType::TRIPLET];
+		return vb(x) * 1.1 + b;
+	}
+	double val_triple1(int x, int y) { 
+		double b = lbd * cardComboScores[(int)CardComboType::TRIPLET1];
+		return max(1.0, vb(x) - vb(y) * 0.1) * 1.15 + b;
+	}
+	double val_triple2(int x, int y) { 
+		double b = lbd * cardComboScores[(int)CardComboType::TRIPLET2];
+		return max(1.0, vb(x) - vb(y) * 0.2) * 1.2 + b;
+	}
+	double val_bomb(int x) { 
+		double b = lbd * cardComboScores[(int)CardComboType::BOMB];
+		return b + vb(x) / 15;
+	}
+	double val_quadruple2(int x, int y, int z) { 
+		double b = lbd * cardComboScores[(int)CardComboType::QUADRUPLE2];
+		return max(1.0, vb(x) - (vb(y) + vb(z)) * 0.1) * 1.25 + b;
+	}
+	double val_quadruple4(int x, int y, int z) {
+		double b = lbd * cardComboScores[(int)CardComboType::QUADRUPLE4];
+		return max(1.0, vb(x) - (vb(y) + vb(z)) * 0.2) * 1.3 + b;
+	}
+
+	double val_rocket() { 
+		double b = lbd * cardComboScores[(int)CardComboType::ROCKET];
+		return b;
+	}
+	double val_straight(int st, int len) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::STRAIGHT];
+		double v = (len - 5) / 20 + 1.1;
+		return (vb(x) - 3) * v + b;
+	}
+	double val_straight2(int st, int len) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::STRAIGHT2];
+		double v = (len - 3) / 10 + 1.15;
+		return (vb(x) - 3) * v + b;
+	}
+	double val_plane(int st, int len) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::PLANE];
+		double v = (len - 2) / 9 + 1.2;
+		return (vb(x) - 3) * v + b;
+	}
+	double val_plane1(int st, int len, vector<Card> ext) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::PLANE1];
+		double sum = 0; 
+		for (int i = 0; i < ext.size(); ++i) sum += val_single(ext[i]);
+		double v = (len - 2) / 9 + 1.25;
+		return (vb(x) - 3 - sum / len * 0.1) * v + b;
+		//return (vb(x) - 3 - sum / len * 0.1) * 1.1 + b;
+	}
+	double val_plane2(int st, int len, vector<Card> ext) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::PLANE2];
+		double sum = 0; 
+		for (int i = 0; i < ext.size(); ++i) sum += val_pair(ext[i]);
+		double v = (len - 2) / 9 + 1.3;
+		return (vb(x) - 3 - sum / len * 0.2) * v + b;
+		//return (vb(x) - 3 - sum / len * 0.2) * 1.2 + b;
+	}
+	double val_sshuttle(int st, int len) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::SSHUTTLE];
+		double v = (len - 2) / 9 + 1.25;
+		return (vb(x) - 3) * v + b;
+	}
+	double val_sshuttle2(int st, int len, vector<Card> ext) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::SSHUTTLE2];
+		double sum = 0; 
+		for (int i = 0; i < ext.size(); ++i) sum += val_single(ext[i]);
+		double v = (len - 2) / 9 + 1.3;
+
+		return (vb(x) - 3 - sum / ext.size() * 0.1) * v + b;
+	}
+	double val_sshuttle4(int st, int len, vector<Card> ext) { 
+		int x = st + len - 1;
+		double b = lbd * cardComboScores[(int)CardComboType::SSHUTTLE4];
+		double sum = 0;
+		for (int i = 0; i < ext.size(); ++i) sum += val_pair(ext[i]);
+		double v = (len - 2) / 9 + 1.35;
+		return (vb(x) - 3 - sum / ext.size() * 0.2) * v + b;
+	}
+
+	double calc(status s);
+	double dfs(status s, vector<Card> ext, int l, int r, int lst, int cnt, int mcnt, int k = 1) {
+		//cerr << "dfs "; s.out(); 
+		//cerr << "ext : "; for (int i = 0; i < ext.size(); ++i) cerr << ext[i] << " "; cerr << endl;
+		//cerr << "l = " << l << " r = " << r << " lst = " << lst << " cnt = " << cnt << " mcnt = " << mcnt << " k = " << k << endl;
+		if (cnt == 0) {
+			double ret_val = 0;
+			if (mcnt == 3)
+				ret_val = (k == 1) ? val_plane1(l, r - l + 1, ext) : val_plane2(l, r - l + 1, ext);
+			else
+				ret_val = (k == 1) ? val_sshuttle2(l, r - l + 1, ext) : val_sshuttle4(l, r - l + 1, ext);
+			return ret_val + calc(s);
+		}
+		if (L - lst - 1 < cnt) return oo;
+		double ret = (int)oo; vector<Card> tmp = ext;
+		if ((lst + 1 < l || lst + 1 > r) && s.cnt[lst + 1] >= k) {
+			s.cnt[lst + 1] -= k; tmp.push_back(lst + 1); 
+			gmin(ret, dfs(s, tmp, l, r, lst + 1, cnt - 1, mcnt, k));
+			s.cnt[lst + 1] += k; tmp.pop_back();
+		}
+		gmin(ret, dfs(s, ext, l, r, lst + 1, cnt, mcnt, k));
+		return ret;
+	}
+	double calc(status s) {
+		//printf("calc : "); s.out(); 
+		if (H.find(s) != H.end()) return H[s];
+		int x = s.Min();
+		if (x == -1) return 0;
+		double &ret = H[s]; ret = (int)oo;
+		status t = s;
+		{ // as main 
+			//single 
+			t.cnt[x]--;
+			gmin(ret, val_single(x) + calc(t));
+			//pair 
+			if (s.cnt[x] >= 2) {
+				t = s; t.cnt[x] -= 2;
+				gmin(ret, val_pair(x) + calc(t));
+			}
+			//triple 
+			if (s.cnt[x] >= 3) {
+				t = s; t.cnt[x] -= 3;
+				gmin(ret, val_triple(x) + calc(t));
+				for (int y = x + 1; y < L; ++y) {
+					if (t.cnt[y] >= 1) {
+						t.cnt[y]--;
+						gmin(ret, val_triple1(x, y) + calc(t));
+						t.cnt[y]++;
+					}
+					if (t.cnt[y] >= 2) {
+						t.cnt[y] -= 2;
+						gmin(ret, val_triple2(x, y) + calc(t));
+						t.cnt[y] += 2;
+					}
+				}
+			}
+			//bomb & quadruple
+			if (s.cnt[x] >= 4) {
+				t = s; t.cnt[x] -= 4;
+				gmin(ret, val_bomb(x) + calc(t));
+				for (int y = x + 1; y < L; ++y)
+					for (int z = y + 1; z < L; ++z) {
+						if (t.cnt[y] >= 1 && t.cnt[z] >= 1) {
+							t.cnt[y]--; t.cnt[z]--;
+							gmin(ret, val_quadruple2(x, y, z) + calc(t));
+							t.cnt[y]++; t.cnt[z]++;
+						}
+						if (t.cnt[y] >= 2 && t.cnt[z] >= 2) {
+							t.cnt[y] -= 2; t.cnt[z] -= 2;
+							gmin(ret, val_quadruple4(x, y, z) + calc(t));
+							t.cnt[y] += 2; t.cnt[z] += 2;
+						}
+					}
+			}
+			// rocket 
+			if (x == 13 && s.cnt[14]) {
+				t = s; t.cnt[13]--; t.cnt[14]--; 
+				gmin(ret, val_rocket() + calc(t));
+			}
+			// straight
+			t = s;
+			for (int len = 1; x + len - 1 < LS && s.cnt[x + len - 1] >= 1; ++len) {
+				--t.cnt[x + len - 1];
+				if (len >= 5) 
+					gmin(ret, val_straight(x, len) + calc(t));
+			}
+			// straight2
+			t = s;
+			for (int len = 1; x + len - 1 < LS && s.cnt[x + len - 1] >= 2; ++len) {
+				t.cnt[x + len - 1] -= 2;
+				if (len >= 3)
+					gmin(ret, val_straight2(x, len) + calc(t));
+			}
+			// plane
+			t = s;
+			for (int len = 1; x + len - 1 < LS && s.cnt[x + len - 1] >= 3; ++len) {
+				t.cnt[x + len - 1] -= 3;
+				if (len >= 2) {
+					vector<Card> v(0);
+					gmin(ret, val_plane(x, len) + calc(t));
+					gmin(ret, dfs(t, v, x, x + len - 1, x + len - 1, len, 3, 1));
+					gmin(ret, dfs(t, v, x, x + len - 1, x + len - 1, len, 3, 2));
+				}
+			}
+			// sshuttle
+			t = s;
+			for (int len = 1; x + len - 1 < LS && s.cnt[x + len - 1] >= 4; ++len) {
+				t.cnt[x + len - 1] -= 4;
+				if (len >= 2) {
+					vector<Card> v(0);
+					gmin(ret, val_sshuttle(x, len) + calc(t));
+					gmin(ret, dfs(t, v, x, x + len - 1, x + len - 1, len * 2, 4, 1));
+					gmin(ret, dfs(t, v, x, x + len - 1, x + len - 1, len * 2, 4, 2));
+				}
+			}
+		} 
+		{
+			// triplet
+			for (int y = x + 1; y < L; ++y)
+				if (s.cnt[y] >= 3) {
+					t = s;
+					t.cnt[y] -= 3;
+					if (t.cnt[x] >= 1) {
+						t.cnt[x] -= 1;
+						gmin(ret, val_triple1(y, x) + calc(t));
+						t.cnt[x] += 1;
+					}
+					if (t.cnt[x] >= 2) {
+						t.cnt[x] -= 2;
+						gmin(ret, val_triple2(y, x) + calc(t));
+						t.cnt[x] += 2;
+					}
+				}
+			// quaduple
+			for (int y = x + 1; y < L; ++y)
+				if (s.cnt[y] >= 4) {
+					t = s; t.cnt[y] -= 4;
+					for (int z = x + 1; z < L; ++z) {
+						if (z == y) continue;
+						if (t.cnt[x] >= 1 && t.cnt[z] >= 1) {
+							t.cnt[x] -= 1; t.cnt[z] -= 1;
+							gmin(ret, val_quadruple2(y, x, z) + calc(t));
+							t.cnt[x] += 1; t.cnt[z] += 1;
+						}
+						if (t.cnt[x] >= 2 && t.cnt[z] >= 2) {
+							t.cnt[x] -= 2; t.cnt[z] -= 2;
+							gmin(ret, val_quadruple4(y, x, z) + calc(t));
+							t.cnt[x] += 2; t.cnt[z] += 2;
+						}
+					}
+				}
+			// plane
+			for (int l = x + 1; l < L; ++l) {
+				t = s;
+				for (int r = l; r < LS && s.cnt[r] >= 3; ++r) {
+					t.cnt[r] -= 3;
+					int len = r - l + 1;
+					if (len >= 2) {
+						for (int k = 1; k <= 2; ++k) {
+							if (t.cnt[x] >= k) {
+								t.cnt[x] -= k;
+								vector<Card> v(1, x);
+								gmin(ret, dfs(t, v, l, r, x, len - 1, 3, k));
+								t.cnt[x] += k;
+							}
+						}
+					}
+				}
+			}
+			// sshuttle
+			for (int l = x + 1; l < L; ++l) {
+				t = s;
+				for (int r = l; r < LS && s.cnt[r] >= 4; ++r) {
+					t.cnt[r] -= 4;
+					int len = r - l + 1;
+					if (len >= 2) {
+						for (int k = 1; k <= 2; ++k) {
+							if (t.cnt[x] >= k) {
+								t.cnt[x] -= k;
+								vector<Card> v(1, x);
+								gmin(ret, dfs(t, v, l, r, x, 2 * len - 1, 4, k));
+								t.cnt[x] += k;
+							}
+						}
+					}
+				}
+			}
+		}
+		return ret;
+	}
+	void upd(double &best, status &s, status t) {
+		double tmp = calc(t);
+		//printf("try to upd %.3lf ", best); s.out(); 
+		//printf("with %.3lf ", tmp); t.out();
+		if (tmp < best || (tmp == best && (t < s)))
+			best = tmp, s = t;
+		else {
+			if (!(s < global_s) && !(global_s < s)) //这个东西是这样：发现这个bot为了不拆最后的一个巨大顺子，总是喊过，这行判断的意思是 如果s == global_s，即当前的最优剩余状态=当前状态，即最优方案是什么都不出，我们不希望看到这种情况，所以结合全局的were_to_lose（意思就是，如果我们输定了，我们起码要出点牌得一些小分）我是直接判对方和自己的牌数之差的 
+				if (Once || cardRemaining[myPosition] <= 4 || (were_to_lose) || (global_cnt < 8 && (tmp - best) / best < 0.3))
+					best = tmp, s = t;
+		}
+	}
+	bool check_len(int len, int mcnt) {
+		if (mcnt == 1) return len >= 5;
+		if (mcnt == 2) return len >= 3;
+		return len >= 2;
+	}
+	int type_aff(CardComboType t) {
+		if (t == CardComboType::TRIPLET1 || t == CardComboType::TRIPLET2 || t == CardComboType::PLANE1 || t == CardComboType::PLANE2) return 1;
+		if (t == CardComboType::QUADRUPLE2 || t == CardComboType::QUADRUPLE4 || t == CardComboType::SSHUTTLE2 || t == CardComboType::SSHUTTLE4) return 2;
+		return 0;
+	}
+	int type_cnt(CardComboType t) {
+		if (t == CardComboType::TRIPLET2 || t == CardComboType::PLANE2 || t == CardComboType::QUADRUPLE4 || t == CardComboType::SSHUTTLE4) return 2;
+		return 1;
+	}
+	void move_dfs(double &best, status &t, status s, int l, int r, int cur, int cnt, int k) {
+		if (cnt == 0) {
+			upd(best, t, s);
+			return;
+		}
+		if (L - cur < cnt) return;
+		if ((cur < l || cur > r) && s.cnt[cur] >= k) {
+			s.cnt[cur] -= k;
+			move_dfs(best, t, s, l, r, cur + 1, cnt - 1, k);
+			s.cnt[cur] += k;
+		}
+		move_dfs(best, t, s, l, r, cur + 1, cnt, k);
+	}
+	
+	bool dominate(int x) {
+		for (int y = x + 1; y < 15; ++y)
+			if (levelRemaining[y] > 0) return 0;
+		return 1;
+	}
+	template <class it>
+	CardCombo nextMove(it beg, it end) {
+		CardComboType comboType = lastValidCombo.comboType;
+		bool passed = (comboType == CardComboType::PASS);
+		int comboLen = passed ? 0 : lastValidCombo.comboLen();
+		int comboVal = passed ? 0 : lastValidCombo.comboVal();
+		int comboCnt = passed ? 0 : lastValidCombo.comboCnt();
+
+		//------------------------------------------
+		
+		CardCombo cardsAll = CardCombo(beg, end);
+		bool once = cardsAll.comboType != CardComboType::INVALID;
+		Once = once;
+		int res_cards = cardRemaining[myPosition];
+		if (res_cards <= 4) {
+			if (passed && once) {
+				return cardsAll;
+			}
+			if (passed && !once) {
+				if (res_cards == 2) { // 只能是两张单牌
+					Card a = *beg, b = *(++beg); --beg;
+					if (a < b) swap(a, b); // a > b
+					vector<Card> tmpa; tmpa.pb(a);
+					vector<Card> tmpb; tmpb.pb(b);
+					if (dominate(a)) {
+						return CardCombo(tmpa.begin(), tmpa.end());
+					} else {
+						if (myPosition == 2) { // 地主后出牌的农民
+							return CardCombo(tmpa.begin(), tmpa.end());
+						} else {
+							return CardCombo(tmpb.begin(), tmpb.end());
+						}
+					}
+				} else {
+					int enemy_rest = (myPosition == 0) ? min(cardRemaining[1], cardRemaining[2]) : cardRemaining[0];
+					vector<Card> all(beg, end);
+					sort(all.begin(), all.end());
+					if (all.size() == 4 && card2level(all[0]) == card2level(all[1]) && card2level(all[2]) == card2level(all[3])) { // 两对
+						if (enemy_rest <= 1)
+							return CardCombo(all.begin() + 2, all.end()); // 出大的
+						else
+							return CardCombo(all.begin(), all.begin() + 2);
+					} else {
+						if (all.size() == 3) {
+							if (card2level(all[0]) != card2level(all[1]) && card2level(all[1]) != card2level(all[2])) { // 都不一样
+								return CardCombo(all.begin() + 1, all.begin() + 2);
+							} else { // 一对和一个
+								int pair_sc = 1 - int(card2level(all[0]) == card2level(all[1]));
+								if (enemy_rest <= 1) 
+									return CardCombo(all.begin() + pair_sc, all.begin() + pair_sc + 2);
+								else
+									return CardCombo(all.begin(), all.begin() + int(2 - pair_sc));  // 若pair_sc, 则前面是单张，只需要+1，否则前面是对子，需要加2)
+							}
+						} else
+							return CardCombo(all.begin() + 1, all.begin() + 2);
+					}
+				}
+			}
+		}
+
+
+
+
+
+
+
+
+
+
+
+
+		//----------------------------------------------
+
+		vector<Card> v;
+		for (it i = beg; i != end; ++i)
+			v.pb(card2level(*i));
+		status s(v);
+		calc_val(s);
+
+		double best = calc(s); status t = s;
+		global_bla = best; global_s = s;
+		global_cnt = v.size();
+
+		// rocket 
+		if (s.cnt[13] && s.cnt[14]) {
+			status tmp = s; tmp.cnt[13]--; tmp.cnt[14]--;
+			upd(best, t, tmp);
+		}
+		// bomb
+		if (comboType != CardComboType::ROCKET) {
+			int st = 0;
+			if (comboType == CardComboType::BOMB) st = comboVal + 1;
+			for (int i = st; i < L; ++i)
+				if (s.cnt[i] >= 4) {
+					status tmp = s; tmp.cnt[i] -= 4;
+					upd(best, t, tmp);
+				}
+		}
+
+		if (comboType == CardComboType::PASS) {
+			// single & pair & triplet & quadruple
+			for (int mcnt = 1; mcnt <= 4; ++mcnt) 
+				for (int i = 0; i < L; ++i)
+					if (s.cnt[i] >= mcnt) {
+						status tmp = s; tmp.cnt[i] -= mcnt;
+						upd(best, t, tmp);
+						if (mcnt == 3) {
+							for (int k = 1; k <= 2; ++k) // triplet1/2
+								for (int x = 0; x < L; ++x)
+									if (x != i && tmp.cnt[x] >= k) {
+										tmp.cnt[x] -= k;
+										upd(best, t, tmp);
+										tmp.cnt[x] += k;
+									}
+						}
+						if (mcnt == 4) {
+							for (int k = 1; k <= 2; ++k) // quadruple2/4
+								for (int x = 0; x < L; ++x)
+									for (int y = x + 1; y < L; ++y)
+										if (x != i && y != i && tmp.cnt[x] >= k && tmp.cnt[y] >= k) {
+											tmp.cnt[x] -= k; tmp.cnt[y] -= k;
+											upd(best, t, tmp);
+											tmp.cnt[x] += k; tmp.cnt[y] += k;
+										}
+						}
+					}
+			// straight1/2 & plane & sshuttle
+			for (int mcnt = 1; mcnt <= 4; ++mcnt) {
+				for (int l = 0; l < LS; ++l) {
+					status tmp = s;
+					for (int r = l; r < LS && s.cnt[r] >= mcnt; ++r) {
+						tmp.cnt[r] -= mcnt;
+						int len = r - l + 1;
+						if (check_len(len, mcnt)) {
+							upd(best, t, tmp);
+							if (mcnt == 3) 
+								for (int k = 1; k <= 2; ++k)
+									move_dfs(best, t, tmp, l, r, 0, len, k);
+							if (mcnt == 4)
+								for (int k = 1; k <= 2; ++k)
+									move_dfs(best, t, tmp, l, r, 0, len * 2, k);
+						}
+					}
+				}
+			}
+		} else 
+			if (comboType != CardComboType::ROCKET && comboType != CardComboType::BOMB) {
+				for (int l = comboVal + 1; l < L; ++l) {
+					int r = l + comboLen - 1;
+					status tmp = s; 
+					if (l < r && r >= LS) continue;
+					bool flag = 1;
+					for (int j = l; j <= r; ++j)
+						if (s.cnt[j] < comboCnt) {
+							flag = 0; break;
+						} else tmp.cnt[j] -= comboCnt;
+					if (!flag) continue;
+					int aff = type_aff(comboType) * comboLen;
+					int k = type_cnt(comboType);
+					move_dfs(best, t, tmp, l, r, 0, aff, k);
+				}
+			}
+		vector<Card> rest, move;
+		for (it i = beg; i != end; ++i) rest.pb(*i);
+		random_shuffle(rest.begin(), rest.end());
+		for (int i = 0; i < rest.size(); ++i) {
+			int l = card2level(rest[i]);
+			if (s.cnt[l] > t.cnt[l]) {
+				--s.cnt[l];
+				move.pb(rest[i]);
+			}
+		}
+		return CardCombo(move.begin(), move.end());
+	}
+
+
+}
+
+
+int main()
+{
+	srand(time(0));
+	BotzoneIO::input();
+
+
+	// 做出决策（你只需修改以下部分）
+
+	// findFirstValid 函数可以用作修改的起点
+	//CardCombo myAction = lastValidCombo.findFirstValid(myCards.begin(), myCards.end());
+	CardCombo myAction = Move::nextMove(myCards.begin(), myCards.end());
+
+	// 是合法牌
+	assert(myAction.comboType != CardComboType::INVALID);
+
+	assert(
+			// 在上家没过牌的时候过牌
+			(lastValidCombo.comboType != CardComboType::PASS && myAction.comboType == CardComboType::PASS) ||
+			// 在上家没过牌的时候出打得过的牌
+			(lastValidCombo.comboType != CardComboType::PASS && lastValidCombo.canBeBeatenBy(myAction)) ||
+			// 在上家过牌的时候出合法牌
+			(lastValidCombo.comboType == CardComboType::PASS && myAction.comboType != CardComboType::INVALID)
+		  );
+
+	// 决策结束，输出结果（你只需修改以上部分）
+
+	myAction.debugPrint();
+
+	BotzoneIO::output(myAction.cards.begin(), myAction.cards.end());
+
+}
